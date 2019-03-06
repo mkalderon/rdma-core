@@ -219,6 +219,45 @@ static inline int qelr_cq_entries(int entries)
 	return entries + 1;
 }
 
+/* Accept qedr_user_db_rec pointer since different structures which
+ * have a doorbell address require this functionality (cq/sq/rq).
+ */
+static int qelr_db_rec_alloc(struct qelr_devctx *cxt,
+			     struct qedr_user_db_rec **db_rec_addr_ptr)
+{
+	uint32_t size = cxt->kernel_page_size;
+	void *addr;
+	int rc;
+
+	/* map the address of the user doorbell recovery entry to kernel */
+	addr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS, QELR_ANON_FD,
+		    QELR_ANON_OFFSET);
+
+	if (addr == MAP_FAILED) {
+		DP_ERR(cxt->dbg_fp, "doorbell recovery mmap failed\n");
+		return errno;
+	}
+
+	rc = ibv_dontfork_range(addr, size);
+	if (rc) {
+		munmap(addr, size);
+		DP_ERR(cxt->dbg_fp,
+		       "doorbell recovery ibv_dontfork_range failed\n");
+		return rc;
+	}
+
+	*db_rec_addr_ptr = addr;
+	return 0;
+}
+
+static void qelr_db_rec_free(struct qelr_devctx *cxt,
+			     struct qedr_user_db_rec **db_rec_addr_ptr)
+{
+	ibv_dofork_range(*db_rec_addr_ptr, cxt->kernel_page_size);
+	munmap(*db_rec_addr_ptr, cxt->kernel_page_size);
+}
+
 struct ibv_cq *qelr_create_cq(struct ibv_context *context, int cqe,
 			      struct ibv_comp_channel *channel,
 			      int comp_vector)
@@ -253,17 +292,26 @@ struct ibv_cq *qelr_create_cq(struct ibv_context *context, int cqe,
 	if (rc)
 		goto err_0;
 
-	cmd.addr = (uintptr_t) cq->chain.first_addr;
+	rc = qelr_db_rec_alloc(cxt, &cq->db_rec_addr);
+	if (rc)
+		goto err_1;
+
+	/* provide kernel with chain address and size and doorbell recovery
+	 * user entry address for mmap
+	 */
+	cmd.addr = (uintptr_t)cq->chain.first_addr;
 	cmd.len = cq->chain.size;
+	cmd.db_rec_addr = (uintptr_t)cq->db_rec_addr;
+
 	rc = ibv_cmd_create_cq(context, cqe, channel, comp_vector,
 			       &cq->ibv_cq, &cmd.ibv_cmd, sizeof(cmd),
 			       &resp.ibv_resp, sizeof(resp));
 	if (rc) {
 		DP_ERR(cxt->dbg_fp, "create cq: failed with rc = %d\n", rc);
-		goto err_1;
+		goto err_2;
 	}
 
-	/* map the doorbell and prepare its data */
+	/* init doorbell params */
 	cq->db.data.icid = htole16(resp.icid);
 	cq->db.data.params = DB_AGG_CMD_SET <<
 		RDMA_PWM_VAL32_DATA_AGG_CMD_SHIFT;
@@ -279,7 +327,8 @@ struct ibv_cq *qelr_create_cq(struct ibv_context *context, int cqe,
 		   "create cq: successfully created %p\n", cq);
 
 	return &cq->ibv_cq;
-
+err_2:
+	qelr_db_rec_free(cxt, &cq->db_rec_addr);
 err_1:
 	qelr_chain_free(&cq->chain);
 err_0:
@@ -305,6 +354,7 @@ int qelr_destroy_cq(struct ibv_cq *ibv_cq)
 	}
 
 	qelr_chain_free(&cq->chain);
+	qelr_db_rec_free(cxt, &cq->db_rec_addr);
 	free(cq);
 
 	DP_VERBOSE(cxt->dbg_fp, QELR_MSG_CQ,
@@ -493,6 +543,13 @@ static inline int qelr_create_qp_buffers_sq(struct qelr_devctx *cxt,
 	qp->sq.max_wr = max_send_wr;
 	qp->sq.max_sges = cxt->sges_per_send_wr;
 
+	rc = qelr_db_rec_alloc(cxt, &qp->sq.db_rec_addr);
+	if (rc) {
+		qelr_chain_free(&qp->sq.chain);
+		DP_ERR(cxt->dbg_fp,
+		       "create qp: failed to map SQ db rec, got %d", rc);
+	}
+
 	return rc;
 }
 
@@ -520,6 +577,13 @@ static inline int qelr_create_qp_buffers_rq(struct qelr_devctx *cxt,
 	qp->rq.max_wr = max_recv_wr;
 	qp->rq.max_sges = cxt->sges_per_recv_wr;
 
+	rc = qelr_db_rec_alloc(cxt, &qp->rq.db_rec_addr);
+	if (rc) {
+		DP_ERR(cxt->dbg_fp,
+		       "create qp: failed to map RQ db rec, got %d", rc);
+		qelr_chain_free(&qp->rq.chain);
+	}
+
 	return rc;
 }
 
@@ -536,6 +600,7 @@ static inline int qelr_create_qp_buffers(struct qelr_devctx *cxt,
 	rc = qelr_create_qp_buffers_rq(cxt, qp, attrs);
 	if (rc) {
 		qelr_chain_free_sq(qp);
+		qelr_db_rec_free(cxt, &qp->sq.db_rec_addr);
 		return rc;
 	}
 
@@ -631,6 +696,7 @@ qelr_create_qp_configure_sq_req(struct qelr_qp *qp,
 {
 	req->sq_addr = (uintptr_t)qp->sq.chain.first_addr;
 	req->sq_len = qp->sq.chain.size;
+	req->sq_db_rec_addr = (uintptr_t)qp->sq.db_rec_addr;
 }
 
 static inline void
@@ -639,6 +705,7 @@ qelr_create_qp_configure_rq_req(struct qelr_qp *qp,
 {
 	req->rq_addr = (uintptr_t)qp->rq.chain.first_addr;
 	req->rq_len = qp->rq.chain.size;
+	req->rq_db_rec_addr = (uintptr_t)qp->rq.db_rec_addr;
 }
 
 static inline void
@@ -990,6 +1057,8 @@ int qelr_destroy_qp(struct ibv_qp *ibqp)
 	qelr_free_rq(qp);
 	qelr_chain_free_sq(qp);
 	qelr_chain_free_rq(qp);
+	qelr_db_rec_free(cxt, &qp->sq.db_rec_addr);
+	qelr_db_rec_free(cxt, &qp->rq.db_rec_addr);
 	free(qp);
 
 	DP_VERBOSE(cxt->dbg_fp, QELR_MSG_QP,
@@ -1278,6 +1347,8 @@ static inline void doorbell_qp(struct qelr_qp *qp)
 {
 	mmio_wc_start();
 	writel(qp->sq.db_data.raw, qp->sq.db);
+	/* copy value to doorbell recovery mechanism */
+	qp->sq.db_rec_addr->db_data = qp->sq.db_data.raw;
 	mmio_flush_writes();
 }
 
@@ -1801,6 +1872,8 @@ int qelr_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 		qp->rq.db_data.data.value = htole16(db_val);
 
 		writel(qp->rq.db_data.raw, qp->rq.db);
+		/* copy value to doorbell recovery mechanism */
+		qp->rq.db_rec_addr->db_data = qp->rq.db_data.raw;
 		mmio_flush_writes();
 
 		if (iwarp) {
@@ -2192,6 +2265,8 @@ static void doorbell_cq(struct qelr_cq *cq, uint32_t cons, uint8_t flags)
 	cq->db.data.value = htole32(cons);
 
 	writeq(cq->db.raw, cq->db_addr);
+	/* copy value to doorbell recovery mechanism */
+	cq->db_rec_addr->db_data = cq->db.raw;
 	mmio_flush_writes();
 }
 

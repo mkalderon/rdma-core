@@ -157,6 +157,7 @@ struct qelr_cq {
 
 	void			*db_addr;
 	union db_prod64		db;
+	struct qedr_user_db_rec *db_rec_addr;
 
 	uint8_t			chain_toggle;
 	union rdma_cqe		*latest_cqe;
@@ -195,6 +196,8 @@ struct qelr_qp_hwq_info {
 	void					*db;      /* Doorbell address */
 	void					*edpm_db;
 	union db_prod32				db_data;  /* Doorbell data */
+	/* Doorbell recovery entry address */
+	struct qedr_user_db_rec			*db_rec_addr;
 	void					*iwarp_db2;
 	union db_prod32				iwarp_db2_data;
 
@@ -357,5 +360,8 @@ static inline struct qelr_srq *get_qelr_srq(struct ibv_srq *ibsrq)
 #define QELR_MAX_RQ_WQE_SIZE (RDMA_MAX_SGE_PER_RQ_WQE)
 #define QELR_MAX_SQ_WQE_SIZE (ROCE_REQ_MAX_SINGLE_SQ_WQE_SIZE /	\
 			      ROCE_WQE_ELEM_SIZE)
+
+#define QELR_ANON_FD            (-1)    /* MAP_ANONYMOUS => file desc.= -1  */
+#define QELR_ANON_OFFSET        (0)     /* MAP_ANONYMOUS => offset    = d/c */
 
 #endif /* __QELR_H__ */
