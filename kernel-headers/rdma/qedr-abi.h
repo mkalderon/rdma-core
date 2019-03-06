@@ -68,6 +68,7 @@ struct qedr_alloc_pd_uresp {
 struct qedr_create_cq_ureq {
 	__aligned_u64 addr;
 	__aligned_u64 len;
+	__aligned_u64 db_rec_addr;
 };
 
 struct qedr_create_cq_uresp {
@@ -93,6 +94,12 @@ struct qedr_create_qp_ureq {
 
 	/* length of RQ buffer */
 	__aligned_u64 rq_len;
+
+	/* address of SQ doorbell recovery user entry */
+	__aligned_u64 sq_db_rec_addr;
+
+	/* address of RQ doorbell recovery user entry */
+	__aligned_u64 rq_db_rec_addr;
 };
 
 struct qedr_create_qp_uresp {
@@ -126,6 +133,14 @@ struct qedr_create_srq_uresp {
 	__u16 srq_id;
 	__u16 reserved0;
 	__u32 reserved1;
+};
+
+/* doorbell recovery entry allocated and populated by userspace doorbelling
+ * entities and mapped to kernel. Kernel uses this to register doorbell
+ * information with doorbell drop recovery mechanism.
+ */
+struct qedr_user_db_rec {
+	__aligned_u64 db_data; /* doorbell data */
 };
 
 #endif /* __QEDR_USER_H__ */
